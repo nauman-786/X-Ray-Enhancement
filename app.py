@@ -4,22 +4,6 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
-
-# --- Compatibility shim -----------------------------------------------------
-# streamlit-drawable-canvas (last released 2023) calls
-# streamlit.elements.image.image_to_url, which newer Streamlit versions
-# removed/relocated. Patch it back in under its old name so the canvas
-# library keeps working without downgrading Streamlit.
-import streamlit.elements.image as _st_image_module
-if not hasattr(_st_image_module, "image_to_url"):
-    try:
-        from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
-    except ImportError:
-        from streamlit.elements.lib.image_utils import AtomicImage  # noqa: F401
-        _image_to_url = None
-    if _image_to_url is not None:
-        _st_image_module.image_to_url = _image_to_url
-
 from streamlit_drawable_canvas import st_canvas
 
 st.set_page_config(page_title="X-ray Enhancer", page_icon="🩻", layout="wide")
@@ -94,6 +78,22 @@ def apply_window(img, level, width):
     return windowed.astype(np.uint8)
 
 
+def show_image(container, img, caption=None, **kwargs):
+    """st.image wrapper that works across Streamlit versions old and new.
+
+    Newer Streamlit only accepts use_container_width; older Streamlit only
+    accepts use_column_width. Try the modern kwarg first, fall back to the
+    legacy one, and fall back again to no width kwarg at all if both fail.
+    """
+    try:
+        container.image(img, caption=caption, use_container_width=True, **kwargs)
+    except TypeError:
+        try:
+            container.image(img, caption=caption, use_column_width=True, **kwargs)
+        except TypeError:
+            container.image(img, caption=caption, **kwargs)
+
+
 def roi_stats(img, x0, y0, x1, y1):
     x0, x1 = sorted((int(x0), int(x1)))
     y0, y1 = sorted((int(y0), int(y1)))
@@ -153,12 +153,11 @@ if uploaded_file is not None:
             order = ["original", "denoised", "local_contrast", "multiscale", "sharpened", "final"]
             cols = st.columns(len(order))
             for col, key in zip(cols, order):
-                col.image(stages[key], caption=key.replace("_", " ").title(),
-                          use_column_width=True)
+                show_image(col, stages[key], caption=key.replace("_", " ").title())
         else:
             col1, col2 = st.columns(2)
-            col1.image(stages["original"], caption="Original", use_column_width=True)
-            col2.image(stages["final"], caption="Enhanced", use_column_width=True)
+            show_image(col1, stages["original"], caption="Original")
+            show_image(col2, stages["final"], caption="Enhanced")
 
         success, buf = cv2.imencode(".png", stages["final"])
         if success:
@@ -218,7 +217,9 @@ if uploaded_file is not None:
 
         with view_col:
             st.subheader("Draw a region to inspect (ROI)")
-            display_img = Image.fromarray(windowed)
+            # Canvas backgrounds need RGB, not single-channel grayscale ("L"),
+            # or the background image can fail to render (shows as blank/black).
+            display_img = Image.fromarray(windowed).convert("RGB")
 
             max_canvas_width = 650
             scale = min(1.0, max_canvas_width / display_img.width)
@@ -273,7 +274,7 @@ if uploaded_file is not None:
                                 (crop.shape[1] * zoom_factor, crop.shape[0] * zoom_factor),
                                 interpolation=cv2.INTER_CUBIC,
                             )
-                            st.image(crop_zoomed, caption="Zoomed ROI", use_column_width=True)
+                            show_image(st, crop_zoomed, caption="Zoomed ROI")
                             st.download_button(
                                 "⬇ Download Zoomed ROI",
                                 data=cv2.imencode(".png", crop_zoomed)[1].tobytes(),
