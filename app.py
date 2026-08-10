@@ -4,7 +4,28 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
+from streamlit.elements.lib.layout_utils import LayoutConfig
+
+try:
+    # --- Compatibility shim -------------------------------------------------
+    # streamlit-drawable-canvas (last released 2023) calls
+    # streamlit.elements.image.image_to_url, which newer Streamlit versions
+    # removed/relocated. Patch it back in under its old name so the canvas
+    # library keeps working without downgrading Streamlit.
+    import streamlit.elements.image as _st_image_module
+
+    from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
+
+    def _compat_image_to_url(image, layout_config, clamp, channels, output_format, image_id):
+        if not isinstance(layout_config, LayoutConfig):
+            layout_config = LayoutConfig(width=layout_config)
+        return _image_to_url(image, layout_config, clamp, channels, output_format, image_id)
+
+    _st_image_module.image_to_url = _compat_image_to_url
+
+    from streamlit_drawable_canvas import st_canvas
+except ModuleNotFoundError:
+    st_canvas = None
 
 st.set_page_config(page_title="X-ray Enhancer", page_icon="🩻", layout="wide")
 
@@ -78,22 +99,6 @@ def apply_window(img, level, width):
     return windowed.astype(np.uint8)
 
 
-def show_image(container, img, caption=None, **kwargs):
-    """st.image wrapper that works across Streamlit versions old and new.
-
-    Newer Streamlit only accepts use_container_width; older Streamlit only
-    accepts use_column_width. Try the modern kwarg first, fall back to the
-    legacy one, and fall back again to no width kwarg at all if both fail.
-    """
-    try:
-        container.image(img, caption=caption, use_container_width=True, **kwargs)
-    except TypeError:
-        try:
-            container.image(img, caption=caption, use_column_width=True, **kwargs)
-        except TypeError:
-            container.image(img, caption=caption, **kwargs)
-
-
 def roi_stats(img, x0, y0, x1, y1):
     x0, x1 = sorted((int(x0), int(x1)))
     y0, y1 = sorted((int(y0), int(y1)))
@@ -153,11 +158,12 @@ if uploaded_file is not None:
             order = ["original", "denoised", "local_contrast", "multiscale", "sharpened", "final"]
             cols = st.columns(len(order))
             for col, key in zip(cols, order):
-                show_image(col, stages[key], caption=key.replace("_", " ").title())
+                col.image(stages[key], caption=key.replace("_", " ").title(),
+                          use_container_width=True)
         else:
             col1, col2 = st.columns(2)
-            show_image(col1, stages["original"], caption="Original")
-            show_image(col2, stages["final"], caption="Enhanced")
+            col1.image(stages["original"], caption="Original", use_container_width=True)
+            col2.image(stages["final"], caption="Enhanced", use_container_width=True)
 
         success, buf = cv2.imencode(".png", stages["final"])
         if success:
@@ -217,30 +223,37 @@ if uploaded_file is not None:
 
         with view_col:
             st.subheader("Draw a region to inspect (ROI)")
-            # Canvas backgrounds need RGB, not single-channel grayscale ("L"),
-            # or the background image can fail to render (shows as blank/black).
-            display_img = Image.fromarray(windowed).convert("RGB")
+            display_img = Image.fromarray(windowed)
 
-            max_canvas_width = 650
-            scale = min(1.0, max_canvas_width / display_img.width)
-            canvas_w = int(display_img.width * scale)
-            canvas_h = int(display_img.height * scale)
+            if st_canvas is None:
+                st.warning(
+                    "ROI drawing is unavailable because `streamlit-drawable-canvas` is not installed. "
+                    "The app is still usable for upload, enhancement, and downloads."
+                )
+                st.image(display_img, use_container_width=True)
+                canvas_result = None
+                scale = 1.0
+            else:
+                max_canvas_width = 650
+                scale = min(1.0, max_canvas_width / display_img.width)
+                canvas_w = int(display_img.width * scale)
+                canvas_h = int(display_img.height * scale)
 
-            canvas_result = st_canvas(
-                fill_color="rgba(255, 165, 0, 0.15)",
-                stroke_width=2,
-                stroke_color="#FFA500",
-                background_image=display_img.resize((canvas_w, canvas_h)),
-                update_streamlit=True,
-                height=canvas_h,
-                width=canvas_w,
-                drawing_mode="rect",
-                key="roi_canvas_v2",
-            )
+                canvas_result = st_canvas(
+                    fill_color="rgba(255, 165, 0, 0.15)",
+                    stroke_width=2,
+                    stroke_color="#FFA500",
+                    background_image=display_img.resize((canvas_w, canvas_h)),
+                    update_streamlit=True,
+                    height=canvas_h,
+                    width=canvas_w,
+                    drawing_mode="rect",
+                    key="roi_canvas",
+                )
 
-        st.subheader("Selected Region")
+        st.subheader("ROI Statistics")
         roi_found = False
-        if canvas_result.json_data is not None:
+        if canvas_result is not None and canvas_result.json_data is not None:
             objects = canvas_result.json_data.get("objects", [])
             if objects:
                 obj = objects[-1]  # most recently drawn rectangle
@@ -252,48 +265,15 @@ if uploaded_file is not None:
                 stats = roi_stats(windowed, x0, y0, x1, y1)
                 if stats:
                     roi_found = True
-
-                    # Crop the exact region and blow it up so it's clearly visible,
-                    # regardless of how small the drawn box was.
-                    xi0, xi1 = sorted((int(x0), int(x1)))
-                    yi0, yi1 = sorted((int(y0), int(y1)))
-                    xi0, yi0 = max(xi0, 0), max(yi0, 0)
-                    xi1, yi1 = min(xi1, windowed.shape[1]), min(yi1, windowed.shape[0])
-                    crop = windowed[yi0:yi1, xi0:xi1]
-
-                    zoom_col, stats_col = st.columns([1, 1])
-
-                    with zoom_col:
-                        if crop.size > 0:
-                            # Upscale small crops with nearest-neighbor-free interpolation
-                            # so fine structure stays sharp, not blurry.
-                            target_w = 500
-                            zoom_factor = max(1, target_w // max(crop.shape[1], 1))
-                            crop_zoomed = cv2.resize(
-                                crop,
-                                (crop.shape[1] * zoom_factor, crop.shape[0] * zoom_factor),
-                                interpolation=cv2.INTER_CUBIC,
-                            )
-                            show_image(st, crop_zoomed, caption="Zoomed ROI")
-                            st.download_button(
-                                "⬇ Download Zoomed ROI",
-                                data=cv2.imencode(".png", crop_zoomed)[1].tobytes(),
-                                file_name="roi_zoomed.png",
-                                mime="image/png",
-                                key="roi_download",
-                            )
-
-                    with stats_col:
-                        st.metric("Width (px)", stats["width_px"])
-                        st.metric("Height (px)", stats["height_px"])
-                        m1, m2 = st.columns(2)
-                        m1.metric("Mean", f"{stats['mean']:.1f}")
-                        m2.metric("Median", f"{stats['median']:.1f}")
-                        m3, m4 = st.columns(2)
-                        m3.metric("Std Dev", f"{stats['std']:.1f}")
-                        m4.metric("Min / Max", f"{stats['min']} / {stats['max']}")
+                    c1, c2, c3, c4, c5, c6 = st.columns(6)
+                    c1.metric("Width (px)", stats["width_px"])
+                    c2.metric("Height (px)", stats["height_px"])
+                    c3.metric("Mean", f"{stats['mean']:.1f}")
+                    c4.metric("Median", f"{stats['median']:.1f}")
+                    c5.metric("Std Dev", f"{stats['std']:.1f}")
+                    c6.metric("Min / Max", f"{stats['min']} / {stats['max']}")
 
         if not roi_found:
-            st.info("Draw a rectangle on the image above to see a zoomed view and intensity stats for that region.")
+            st.info("Draw a rectangle on the image above to see intensity stats for that region.")
 else:
     st.info("Upload an image above to get started.")
