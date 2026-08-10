@@ -2,4 +2,4 @@ streamlit
 opencv-python-headless
 numpy
 Pillow
-streamlit-drawable-canvas
+streamlit-drawable-canvas-fix
