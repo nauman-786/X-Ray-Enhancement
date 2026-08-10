@@ -235,7 +235,7 @@ if uploaded_file is not None:
                 height=canvas_h,
                 width=canvas_w,
                 drawing_mode="rect",
-                key="roi_canvas",
+                key="roi_canvas_v2",
             )
 
         st.subheader("Selected Region")
